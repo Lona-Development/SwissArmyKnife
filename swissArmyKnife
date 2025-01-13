@@ -1,0 +1,504 @@
+#!/usr/bin/php
+
+<?php
+
+/*
+ *
+ * LonaDB Swiss Army Knife
+ * author: Hymmel
+ * version: 1.0.0
+ * 
+ */
+
+class swissArmyKnife {
+    public function __construct(Array $argv) {
+        $this->argv = $argv;
+
+        if (!isset($this->argv[1]) || !is_dir($this->argv[1])) {
+            echo 'Invalid directory' . PHP_EOL;
+            exit();
+        }
+
+        if(!isset($this->argv[2])) {
+            echo 'Invalid command' . PHP_EOL;
+            exit();
+        }
+
+        $directory = scandir($this->argv[1]);
+        foreach ($directory as $file) {
+            if (preg_match('/LonaDB-.*\.phar/', $file)) {
+                $this->phar = $file;
+            }
+            if ($file == 'data') {
+                $this->data = $file;
+            }
+            if($file == 'configuration.lona') {
+                $this->configFile = $file;
+            }
+        }
+
+        if (!isset($this->phar)) {
+            echo 'LonaDB phar not found' . PHP_EOL;
+            exit();
+        }
+
+        if (!isset($this->configFile)) {
+            echo 'Configuration file not found' . PHP_EOL;
+            exit();
+        }
+
+        if (!isset($this->data)) {
+            echo 'Data folder not found' . PHP_EOL;
+            exit();
+        }
+
+        if (!is_readable($this->argv[1] . '/' . $this->configFile)) {
+            throw new Exception('Configuration file not readable');
+        }
+
+        $key = readline('Enter encryption key: ');
+
+        echo "\033[2J\033[1;1H";
+
+        $this->key = $key;
+
+        $configParts = explode(":", file_get_contents($this->argv[1] . '/' . $this->configFile));
+        $this->config = json_decode(openssl_decrypt($configParts[0], 'AES-256-CBC', $this->key, 0, base64_decode($configParts[1])), true);
+
+        if(!$this->config) {
+            echo 'Invalid encryption key' . PHP_EOL;
+            exit();
+        }
+
+        preg_match('/LonaDB-(\d+)\.(\d+)\.(\d+)\-.*\.phar/', $this->phar, $matches);
+        $this->version = [
+            'major' => $matches[1],
+            'minor' => $matches[2],
+            'patch' => $matches[3]
+        ];
+
+        echo "LonaDB version: " . $this->version['major'] . '.' . $this->version['minor'] . '.' . $this->version['patch'] . PHP_EOL;
+
+        $this->walEnabled = true;
+        if($this->version["major"] < 5) {
+            $this->walEnabled = false;
+            echo "Your LonaDB version does not support write-ahead logging. Please upgrage." . PHP_EOL;
+        }
+
+        echo PHP_EOL;
+
+        $this->tableEncryptionKey = $this->config['encryptionKey'];
+
+        switch($argv[2]) {
+            case 'config':
+                $this->config($argv);
+                break;
+            case 'table':
+                $this->table($argv);
+                break;
+            case 'user':
+                $this->user($argv);
+                break;
+            case 'changeEncryptionKey':
+                $iv = openssl_random_pseudo_bytes(openssl_cipher_iv_length('AES-256-CBC'));
+                $config = json_encode($this->config);
+                $config = openssl_encrypt($config, 'AES-256-CBC', $argv[3], 0, $iv);
+                file_put_contents($this->argv[1] . '/' . $this->configFile, $config . ':' . base64_encode($iv));
+                echo 'Changed' . PHP_EOL;
+                break;
+            case 'backup':
+                $this->backup($argv);
+                break;
+            case 'restore':
+                $this->restore($argv);
+                break;
+            default:
+                echo 'Invalid command' . PHP_EOL;
+        }
+    }
+
+    private function config(Array $argv): void {
+        switch($argv[3]) {
+            case 'set':
+                if($argv[4] == 'encryptionKey') {
+                    echo 'Changing the encryption key will result in loss of all data if not performed correctly. Please contact the Lona-Development team for assistance.' . PHP_EOL;
+                    exit();
+                }
+
+                $this->config[$argv[4]] = $argv[5];
+
+                $config = json_encode($this->config);
+                $iv = openssl_random_pseudo_bytes(openssl_cipher_iv_length('AES-256-CBC'));
+                $config = openssl_encrypt($config, 'AES-256-CBC', $this->key, 0, $iv);
+                file_put_contents($this->argv[1] . '/' . $this->configFile, $config . ':' . base64_encode($iv));
+                echo 'Changed' . PHP_EOL;
+                break;
+            case 'get':
+                echo $this->config[$argv[4]].PHP_EOL;
+                break;
+            case 'print':
+                echo json_encode($this->config, JSON_PRETTY_PRINT).PHP_EOL;
+                break;
+            default:
+                throw new Exception('Invalid command');
+        }
+    }
+
+    private function table(Array $argv): void {
+        switch($argv[3]) {
+            case 'create':
+                $iv = openssl_random_pseudo_bytes(openssl_cipher_iv_length('AES-256-CBC'));
+                $data = openssl_encrypt(json_encode([
+                    "data" => [],
+                    "permissions" => [],
+                    "owner" => "root",
+                    "logLevel" => 0
+                ]), 'AES-256-CBC', $this->tableEncryptionKey, 0, $iv);
+                file_put_contents($this->argv[1] . '/' . $this->data . '/tables/' . $argv[4] . '.lona', $data . ':' . base64_encode($iv));
+
+                if($this->walEnabled) {
+                    $iv = openssl_random_pseudo_bytes(openssl_cipher_iv_length('AES-256-CBC'));
+                    $data = openssl_encrypt(json_encode([]), 'AES-256-CBC', $this->tableEncryptionKey, 0, $iv);
+                    file_put_contents($this->argv[1] . '/' . $this->data . '/wal/' . $argv[4] . '.lona', $data . ':' . base64_encode($iv));
+                }
+                break;
+            case 'delete':
+                unlink($this->argv[1] . '/' . $this->data . '/tables/' . $argv[4] . '.lona');
+                if($this->walEnabled)
+                    unlink($this->argv[1] . '/' . $this->data . '/wal/' . $argv[4] . '.lona');
+                break;
+            case 'print':
+                $dataFile = file_get_contents($this->argv[1] . '/' . $this->data . '/tables/' . $argv[4] . '.lona');
+                $dataParts = explode(':', $dataFile);
+                $data = openssl_decrypt($dataParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($dataParts[1]));
+                echo json_encode(json_decode($data), JSON_PRETTY_PRINT).PHP_EOL;
+                break;
+            default:
+                $this->tableOperation($argv);
+        }
+    }
+
+    private function tableOperation(Array $argv): void {
+        switch($argv[4]) {
+            case 'set':
+                $dataFile = file_get_contents($this->argv[1] . '/' . $this->data . '/tables/' . $argv[3] . '.lona');
+                $dataParts = explode(':', $dataFile);
+                $data = json_decode(openssl_decrypt($dataParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($dataParts[1])), true);
+                $data['data'][$argv[5]] = $argv[6];
+                
+                $data["logLevel"]++;
+
+                if($this->walEnabled) {
+                    $walFile = file_get_contents($this->argv[1] . '/' . $this->data . '/wal/' . $argv[3] . '.lona');
+                    $walParts = explode(':', $walFile);
+                    $wal = json_decode(openssl_decrypt($walParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1])), true);
+                    $wal[$data["logLevel"]] = [
+                        time(),
+                        "set",
+                        $argv[5],
+                        $argv[6],
+                        "root"
+                    ];
+                    $wal = openssl_encrypt(json_encode($wal), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1]));
+                    file_put_contents($this->argv[1] . '/' . $this->data . '/wal/' . $argv[3] . '.lona', $wal . ':' . $walParts[1]);
+                }
+
+                $data = openssl_encrypt(json_encode($data), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($dataParts[1]));
+                file_put_contents($this->argv[1] . '/' . $this->data . '/tables/' . $argv[3] . '.lona', $data . ':' . $dataParts[1]);
+                break;
+            case 'get':
+                $dataFile = file_get_contents($this->argv[1] . '/' . $this->data . '/tables/' . $argv[3] . '.lona');
+                $dataParts = explode(':', $dataFile);
+                $data = json_decode(openssl_decrypt($dataParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($dataParts[1])), true);
+
+                if(gettype($data['data'][$argv[5]]) == 'array') {
+                    echo "Table ".$argv[3].": ".$argv[5]." = ".json_encode($data['data'][$argv[5]], JSON_PRETTY_PRINT)." | Type: ".gettype($data['data'][$argv[5]]).PHP_EOL;
+                } else {
+                    echo "Table ".$argv[3].": ".$argv[5]." = ".$data['data'][$argv[5]]." | Type: ".gettype($data['data'][$argv[5]]).PHP_EOL;
+                }
+
+                break;
+            case 'delete':
+                $dataFile = file_get_contents($this->argv[1] . '/' . $this->data . '/tables/' . $argv[3] . '.lona');
+                $dataParts = explode(':', $dataFile);
+                $data = json_decode(openssl_decrypt($dataParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($dataParts[1])), true);
+                unset($data['data'][$argv[5]]);
+
+                $data["logLevel"]++;
+
+                if($this->walEnabled) {
+                    $walFile = file_get_contents($this->argv[1] . '/' . $this->data . '/wal/' . $argv[3] . '.lona');
+                    $walParts = explode(':', $walFile);
+                    $wal = json_decode(openssl_decrypt($walParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1])), true);
+                    $wal[$data["logLevel"]] = [
+                        time(),
+                        "delete",
+                        $argv[5],
+                        "root"
+                    ];
+                    $wal = openssl_encrypt(json_encode($wal), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1]));
+                    file_put_contents($this->argv[1] . '/' . $this->data . '/wal/' . $argv[3] . '.lona', $wal . ':' . $walParts[1]);
+                }
+
+                $data = openssl_encrypt(json_encode($data), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($dataParts[1]));
+                file_put_contents($this->argv[1] . '/' . $this->data . '/tables/' . $argv[3] . '.lona', $data . ':' . $dataParts[1]);
+                break;
+            case 'allow':
+                $dataFile = file_get_contents($this->argv[1] . '/' . $this->data . '/tables/' . $argv[3] . '.lona');
+                $dataParts = explode(':', $dataFile);
+                $data = json_decode(openssl_decrypt($dataParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($dataParts[1])), true);
+                $data['permissions'][$argv[5]][$argv[6]] = true;
+
+                $data["logLevel"]++;
+
+                if($this->walEnabled) {
+                    $walFile = file_get_contents($this->argv[1] . '/' . $this->data . '/wal/' . $argv[3] . '.lona');
+                    $walParts = explode(':', $walFile);
+                    $wal = json_decode(openssl_decrypt($walParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1])), true);
+                    $wal[$data["logLevel"]] = [
+                        time(),
+                        "addPermission",
+                        $argv[5],
+                        $argv[6],
+                        "root"
+                    ];
+                    $wal = openssl_encrypt(json_encode($wal), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1]));
+                    file_put_contents($this->argv[1] . '/' . $this->data . '/wal/' . $argv[3] . '.lona', $wal . ':' . $walParts[1]);
+                }
+
+                $data = openssl_encrypt(json_encode($data), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($dataParts[1]));
+                file_put_contents($this->argv[1] . '/' . $this->data . '/tables/' . $argv[3] . '.lona', $data . ':' . $dataParts[1]);
+                break;
+            case 'deny':
+                $dataFile = file_get_contents($this->argv[1] . '/' . $this->data . '/tables/' . $argv[3] . '.lona');
+                $dataParts = explode(':', $dataFile);
+                $data = json_decode(openssl_decrypt($dataParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($dataParts[1])), true);
+                $data['permissions'][$argv[5]][$argv[6]] = false;
+
+                $data["logLevel"]++;
+
+                if($this->walEnabled) {
+                    $walFile = file_get_contents($this->argv[1] . '/' . $this->data . '/wal/' . $argv[3] . '.lona');
+                    $walParts = explode(':', $walFile);
+                    $wal = json_decode(openssl_decrypt($walParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1])), true);
+                    $wal[$data["logLevel"]] = [
+                        time(),
+                        "removePermission",
+                        $argv[5],
+                        $argv[6],
+                        "root"
+                    ];
+                    $wal = openssl_encrypt(json_encode($wal), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1]));
+                    file_put_contents($this->argv[1] . '/' . $this->data . '/wal/' . $argv[3] . '.lona', $wal . ':' . $walParts[1]);
+                }
+
+                $data = openssl_encrypt(json_encode($data), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($dataParts[1]));
+                file_put_contents($this->argv[1] . '/' . $this->data . '/tables/' . $argv[3] . '.lona', $data . ':' . $dataParts[1]);
+                break;
+            default:
+                echo 'Invalid command' . PHP_EOL;
+                break;
+        }
+    }
+
+    private function user(Array $argv): void {
+        switch($argv[3]) {
+            case 'print':
+                $usersFile = file_get_contents($this->argv[1] . '/' . $this->data . '/Users.lona');
+                $usersParts = explode(':', $usersFile);
+                $users = json_decode(openssl_decrypt($usersParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($usersParts[1])), true);
+                echo json_encode($users, JSON_PRETTY_PRINT).PHP_EOL;
+                break;
+            case 'create':
+                $usersFile = file_get_contents($this->argv[1] . '/' . $this->data . '/Users.lona');
+                $usersParts = explode(':', $usersFile);
+                $users = json_decode(openssl_decrypt($usersParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($usersParts[1])), true);
+
+                $users["logLevel"]++;
+
+                if($this->walEnabled) {
+                    $walFile = file_get_contents($this->argv[1] . '/' . $this->data . '/wal/system/Users.lona');
+                    $walParts = explode(':', $walFile);
+                    $wal = json_decode(openssl_decrypt($walParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1])), true);
+                    $wal[$users["logLevel"]] = [
+                        "action" => "create",
+                        "name" => $argv[4],
+                        "data" => $argv[5]
+                    ];
+                    $wal = openssl_encrypt(json_encode($wal), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1]));
+                    file_put_contents($this->argv[1] . '/' . $this->data . '/wal/system/Users.lona', $wal . ':' . $walParts[1]);
+                }
+
+                $users['users'][$argv[4]] = [
+                    'password' => $argv[5],
+                    'role' => 'user',
+                    'permissions' => [
+                        'default' => true
+                    ]
+                ];
+
+                $users = openssl_encrypt(json_encode($users), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($usersParts[1]));
+                file_put_contents($this->argv[1] . '/' . $this->data . '/Users.lona', $users . ':' . $usersParts[1]);
+                echo 'Created' . PHP_EOL;
+                break;
+            case 'delete':
+                $usersFile = file_get_contents($this->argv[1] . '/' . $this->data . '/Users.lona');
+                $usersParts = explode(':', $usersFile);
+                $users = json_decode(openssl_decrypt($usersParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($usersParts[1])), true);
+
+                $users["logLevel"]++;
+
+                if($this->walEnabled) {
+                    $walFile = file_get_contents($this->argv[1] . '/' . $this->data . '/wal/system/Users.lona');
+                    $walParts = explode(':', $walFile);
+                    $wal = json_decode(openssl_decrypt($walParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1])), true);
+                    $wal[$users["logLevel"]] = [
+                        "action" => "delete",
+                        "name" => $argv[4]
+                    ];
+                    $wal = openssl_encrypt(json_encode($wal), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1]));
+                    file_put_contents($this->argv[1] . '/' . $this->data . '/wal/system/Users.lona', $wal . ':' . $walParts[1]);
+                }
+
+                unset($users['users'][$argv[4]]);
+
+                $users = openssl_encrypt(json_encode($users), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($usersParts[1]));
+                file_put_contents($this->argv[1] . '/' . $this->data . '/Users.lona', $users . ':' . $usersParts[1]);
+                echo 'Deleted' . PHP_EOL;
+                break;
+            case 'allow':
+                $usersFile = file_get_contents($this->argv[1] . '/' . $this->data . '/Users.lona');
+                $usersParts = explode(':', $usersFile);
+                $users = json_decode(openssl_decrypt($usersParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($usersParts[1])), true);
+
+                $users["logLevel"]++;
+
+                if($this->walEnabled) {
+                    $walFile = file_get_contents($this->argv[1] . '/' . $this->data . '/wal/system/Users.lona');
+                    $walParts = explode(':', $walFile);
+                    $wal = json_decode(openssl_decrypt($walParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1])), true);
+                    $wal[$users["logLevel"]] = [
+                        "action" => "addPermission",
+                        "name" => $argv[4],
+                        "data" => $argv[5]
+                    ];
+                    $wal = openssl_encrypt(json_encode($wal), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1]));
+                    file_put_contents($this->argv[1] . '/' . $this->data . '/wal/system/Users.lona', $wal . ':' . $walParts[1]);
+                }
+
+                $users['users'][$argv[4]]['permissions'][$argv[5]] = true;
+
+                $users = openssl_encrypt(json_encode($users), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($usersParts[1]));
+                file_put_contents($this->argv[1] . '/' . $this->data . '/Users.lona', $users . ':' . $usersParts[1]);
+                echo 'Allowed' . PHP_EOL;
+                break;
+            case 'deny':
+                $usersFile = file_get_contents($this->argv[1] . '/' . $this->data . '/Users.lona');
+                $usersParts = explode(':', $usersFile);
+                $users = json_decode(openssl_decrypt($usersParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($usersParts[1])), true);
+
+                //wal
+                $users["logLevel"]++;
+
+                if($this->walEnabled) {
+                    $walFile = file_get_contents($this->argv[1] . '/' . $this->data . '/wal/system/Users.lona');
+                    $walParts = explode(':', $walFile);
+                    $wal = json_decode(openssl_decrypt($walParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1])), true);
+                    $wal[$users["logLevel"]] = [
+                        "action" => "removePermission",
+                        "name" => $argv[4],
+                        "data" => $argv[5]
+                    ];
+                    $wal = openssl_encrypt(json_encode($wal), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1]));
+                    file_put_contents($this->argv[1] . '/' . $this->data . '/wal/system/Users.lona', $wal . ':' . $walParts[1]);
+                }
+
+                $users['users'][$argv[4]]['permissions'][$argv[5]] = false;
+
+                $users = openssl_encrypt(json_encode($users), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($usersParts[1]));
+                file_put_contents($this->argv[1] . '/' . $this->data . '/Users.lona', $users . ':' . $usersParts[1]);
+                echo 'Denied' . PHP_EOL;
+                break;
+            case 'role':
+                if($argv[4] == "set") {
+                    $usersFile = file_get_contents($this->argv[1] . '/' . $this->data . '/Users.lona');
+                    $usersParts = explode(':', $usersFile);
+                    $users = json_decode(openssl_decrypt($usersParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($usersParts[1])), true);
+
+                    $users["logLevel"]++;
+
+                    if($this->walEnabled) {
+                        $walFile = file_get_contents($this->argv[1] . '/' . $this->data . '/wal/system/Users.lona');
+                        $walParts = explode(':', $walFile);
+                        $wal = json_decode(openssl_decrypt($walParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1])), true);
+                        $wal[$users["logLevel"]] = [
+                            "action" => "setRole",
+                            "name" => $argv[5],
+                            "data" => $argv[6]
+                        ];
+                        $wal = openssl_encrypt(json_encode($wal), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1]));
+                        file_put_contents($this->argv[1] . '/' . $this->data . '/wal/system/Users.lona', $wal . ':' . $walParts[1]);
+                    }
+
+                    $users['users'][$argv[5]]['role'] = $argv[6];
+
+                    $users = openssl_encrypt(json_encode($users), 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($usersParts[1]));
+                    file_put_contents($this->argv[1] . '/' . $this->data . '/Users.lona', $users . ':' . $usersParts[1]);
+                    echo 'Role set' . PHP_EOL;
+                } else {
+                    echo 'Invalid command' . PHP_EOL;
+                }
+                break;
+            default:
+                echo 'Invalid command' . PHP_EOL;
+                break;
+        }
+    }
+
+    private function backup(Array $argv): void {
+        switch($argv[3]) {
+            case 'users':
+                $usersFile = file_get_contents($this->argv[1] . '/' . $this->data . '/Users.lona');
+                $usersParts = explode(':', $usersFile);
+                $users = json_decode(openssl_decrypt($usersParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($usersParts[1])), true);
+                file_put_contents($argv[4], json_encode($users, JSON_PRETTY_PRINT));
+                echo 'Backed up' . PHP_EOL;
+                break;
+            case 'table':
+                $tableFile = file_get_contents($this->argv[1] . '/' . $this->data . '/tables/' . $argv[4] . '.lona');
+                $tableParts = explode(':', $tableFile);
+                $table = json_decode(openssl_decrypt($tableParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($tableParts[1])), true);
+                file_put_contents($argv[5], json_encode($table, JSON_PRETTY_PRINT));
+                echo 'Backed up' . PHP_EOL;
+                break;
+            default:
+                echo 'Invalid command' . PHP_EOL;
+        }
+    }
+
+    private function restore(Array $argv): void {
+        switch($argv[3]) {
+            case 'users':
+                $users = json_decode(file_get_contents($argv[4]), true);
+                $users = openssl_encrypt(json_encode($users), 'AES-256-CBC', $this->tableEncryptionKey, 0, $iv);
+                file_put_contents($this->argv[1] . '/' . $this->data . '/Users.lona', $users . ':' . base64_encode($iv));
+                echo 'Recovered' . PHP_EOL;
+                break;
+            case 'table':
+                $iv = openssl_random_pseudo_bytes(openssl_cipher_iv_length('AES-256-CBC'));
+                $table = json_decode(file_get_contents($argv[5]), true);
+                $table = openssl_encrypt(json_encode($table), 'AES-256-CBC', $this->tableEncryptionKey, 0, $iv);
+                file_put_contents($this->argv[1] . '/' . $this->data . '/tables/' . $argv[4] . '.lona', $table . ':' . base64_encode($iv));
+                echo 'Recovered' . PHP_EOL;
+                break;
+            default:
+                echo 'Invalid command' . PHP_EOL;
+        }
+    }
+}
+
+try {
+    $swissArmyKnife = new swissArmyKnife($argv);
+} catch (Exception $e) {
+    echo $e->getMessage();
+}
