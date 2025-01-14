@@ -461,14 +461,36 @@ class swissArmyKnife {
                 $usersFile = file_get_contents($this->argv[1] . '/' . $this->data . '/Users.lona');
                 $usersParts = explode(':', $usersFile);
                 $users = json_decode(openssl_decrypt($usersParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($usersParts[1])), true);
-                file_put_contents($argv[4], json_encode($users, JSON_PRETTY_PRINT));
+
+                if($this->walEnabled) {
+                    $walFile = file_get_contents($this->argv[1] . '/' . $this->data . '/wal/system/Users.lona');
+                    $walParts = explode(':', $walFile);
+                    $wal = json_decode(openssl_decrypt($walParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1])), true);
+                    file_put_contents($argv[4], json_encode([
+                        'users' => $users,
+                        'wal' => $wal
+                    ], JSON_PRETTY_PRINT));
+                } else {
+                    file_put_contents($argv[4], json_encode($users, JSON_PRETTY_PRINT));
+                }
                 echo 'Backed up' . PHP_EOL;
                 break;
             case 'table':
                 $tableFile = file_get_contents($this->argv[1] . '/' . $this->data . '/tables/' . $argv[4] . '.lona');
                 $tableParts = explode(':', $tableFile);
                 $table = json_decode(openssl_decrypt($tableParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($tableParts[1])), true);
-                file_put_contents($argv[5], json_encode($table, JSON_PRETTY_PRINT));
+
+                if($this->walEnabled) {
+                    $walFile = file_get_contents($this->argv[1] . '/' . $this->data . '/wal/' . $argv[4] . '.lona');
+                    $walParts = explode(':', $walFile);
+                    $wal = json_decode(openssl_decrypt($walParts[0], 'AES-256-CBC', $this->tableEncryptionKey, 0, base64_decode($walParts[1])), true);
+                    file_put_contents($argv[5], json_encode([
+                        'table' => $table,
+                        'wal' => $wal
+                    ], JSON_PRETTY_PRINT));
+                } else {
+                    file_put_contents($argv[5], json_encode($table, JSON_PRETTY_PRINT));
+                }
                 echo 'Backed up' . PHP_EOL;
                 break;
             default:
@@ -479,15 +501,39 @@ class swissArmyKnife {
     private function restore(Array $argv): void {
         switch($argv[3]) {
             case 'users':
-                $users = json_decode(file_get_contents($argv[4]), true);
-                $users = openssl_encrypt(json_encode($users), 'AES-256-CBC', $this->tableEncryptionKey, 0, $iv);
+                $iv = openssl_random_pseudo_bytes(openssl_cipher_iv_length('AES-256-CBC'));
+                $source = json_decode(file_get_contents($argv[4]), true);
+                if(!isset($source['users'])) {
+                    echo 'Invalid backup file' . PHP_EOL;
+                    exit();
+                }
+                if($this->walEnabled){
+                    if(!isset($source['wal'])) {
+                        $source['wal'] = [];
+                    }
+                    $wal = openssl_encrypt(json_encode($source['wal']), 'AES-256-CBC', $this->tableEncryptionKey, 0, $iv);
+                    file_put_contents($this->argv[1] . '/' . $this->data . '/wal/system/Users.lona', $wal . ':' . base64_encode($iv));
+                }
+                $users = openssl_encrypt(json_encode($source['users']), 'AES-256-CBC', $this->tableEncryptionKey, 0, $iv);
                 file_put_contents($this->argv[1] . '/' . $this->data . '/Users.lona', $users . ':' . base64_encode($iv));
                 echo 'Recovered' . PHP_EOL;
                 break;
             case 'table':
                 $iv = openssl_random_pseudo_bytes(openssl_cipher_iv_length('AES-256-CBC'));
-                $table = json_decode(file_get_contents($argv[5]), true);
-                $table = openssl_encrypt(json_encode($table), 'AES-256-CBC', $this->tableEncryptionKey, 0, $iv);
+                $source = json_decode(file_get_contents($argv[5]), true);
+                
+                if(!isset($source['table'])) {
+                    echo 'Invalid backup file' . PHP_EOL;
+                    exit();
+                }
+                if($this->walEnabled){
+                    if(!isset($source['wal'])) {
+                        $source['wal'] = [];
+                    }
+                    $wal = openssl_encrypt(json_encode($source['wal']), 'AES-256-CBC', $this->tableEncryptionKey, 0, $iv);
+                    file_put_contents($this->argv[1] . '/' . $this->data . '/wal/' . $argv[4] . '.lona', $wal . ':' . base64_encode($iv));
+                }
+                $table = openssl_encrypt(json_encode($source['table']), 'AES-256-CBC', $this->tableEncryptionKey, 0, $iv);
                 file_put_contents($this->argv[1] . '/' . $this->data . '/tables/' . $argv[4] . '.lona', $table . ':' . base64_encode($iv));
                 echo 'Recovered' . PHP_EOL;
                 break;
